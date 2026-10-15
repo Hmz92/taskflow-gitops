@@ -406,3 +406,130 @@ La 2.1.0 a franchi les deux seuils à la fois (erreurs et lenteur), conformémen
 
 Le postmortem de l'incident de la 2.1.0 est dans [docs/postmortem-2.1.0.md](docs/postmortem-2.1.0.md).
 
+## Jour 3, lab de l'après-midi : la sécurité devient un contrôle automatique (15/10/2026)
+
+### L'idée, en simple
+
+Dans `policies/pssi.md`, l'équipe a écrit cinq règles de sécurité en français (la mini-PSSI de TaskFlow). Mais une règle écrite dans un document, personne n'est obligé de la respecter. Le but de ce lab est de **transformer ces règles en contrôles automatiques** : à chaque Pull Request, un robot vérifie les fichiers, et si une règle est violée, **la PR ne peut plus être mergée**. C'est ce qu'on appelle le « Policy as Code » : la politique de sécurité est écrite sous forme de code, et appliquée par la chaîne elle-même.
+
+On utilise deux outils :
+
+- **conftest** lit nos fichiers YAML (`apps/`) et les compare aux règles écrites en Rego (`policies/kubernetes.rego`). Il est rapide et sert pour les règles R1 à R4.
+- **Trivy** scanne les images à la recherche de failles de sécurité connues. Il sert pour la règle R5.
+
+Le travail de cette partie a été fait surtout par Ezzat (règles, correctif, workflow, exceptions) et relu et mergé par Hamza.
+
+### Étape 1 : lire les règles et lancer conftest
+
+Au départ, `policies/kubernetes.rego` contenait déjà les règles R1 (tag explicite, pas de `latest`) et R2 (images uniquement du registre autorisé). Les règles R3 et R4 étaient à écrire. On a lancé conftest pour voir l'état de départ :
+
+```
+conftest test apps/ --policy policies/
+15 tests, 15 passed, 0 failures
+```
+
+Les 15 tests viennent de 3 vérifications (R1 compte pour deux : « pas de tag » et « tag latest », plus R2) appliquées à chacun des 5 fichiers de `apps/taskflow/`. Tout passe, puisque nos images ont un tag précis et viennent bien de notre registre.
+
+![conftest, état de départ](docs/preuve/38-pssi-conftest-etat-initial.png)
+
+### Étape 2 : écrire R3 et R4
+
+On a ajouté les deux règles manquantes dans `policies/kubernetes.rego`.
+
+- **R3, limite de mémoire.** Chaque conteneur doit déclarer une limite de mémoire. Pourquoi : un conteneur qui consomme toute la mémoire pourrait faire tomber la machine entière et les autres applications avec lui.
+- **R4, pas de root.** Le pod doit déclarer explicitement `runAsNonRoot: true`. Pourquoi : si quelqu'un parvient à prendre le contrôle du conteneur, il ne doit pas y être administrateur, pour limiter les dégâts.
+
+Avec R3 ajoutée, conftest passe à **20 tests, tous réussis** (4 vérifications sur 5 fichiers) : nos conteneurs avaient déjà une limite de mémoire.
+
+![avec R3 : 20 tests](docs/preuve/39-pssi-r3-20-tests.png)
+
+### Étape 3 : rendre le Rollout conforme à R4
+
+Notre Rollout ne disait nulle part « interdit de tourner en root ». R4 aurait donc refusé ce fichier : c'est exactement ce qu'elle est faite pour détecter. On l'a corrigé en ajoutant ces deux lignes dans `apps/taskflow/rollout.yaml`, sous `spec.template.spec` :
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+```
+
+Ce changement est sans risque pour l'application : on a vérifié que l'image de TaskFlow tourne déjà avec un utilisateur normal (l'utilisateur numéro 10001, pas root). Les pods démarrent donc comme avant.
+
+Avec R4 et le correctif, conftest passe à **25 tests, tous réussis** (5 vérifications sur 5 fichiers).
+
+![avec R4 : 25 tests](docs/preuve/40-pssi-r4-25-tests.png)
+
+![conftest, état final](docs/preuve/41-pssi-conftest-final.png)
+
+### Étape 4 : brancher les contrôles dans GitHub (PR #30)
+
+Lancer conftest à la main ne suffit pas : on peut l'oublier. On a donc copié le modèle `exemples/ci/pssi-github.yml` dans `.github/workflows/pssi.yml`. À chaque PR, GitHub lance maintenant deux contrôles tout seul :
+
+- **PSSI manifests (conftest)** : vérifie les règles R1 à R4 ;
+- **PSSI images (Trivy)** : cherche les failles connues dans les images (règle R5).
+
+Tout cela est arrivé par la **PR #30**, `feat: enforce PSSI manifest and image quality gates`, mergée vers 12:03 UTC. Elle contient quatre commits : les règles R3/R4, le correctif non-root, le workflow, et les exceptions Trivy.
+
+**Le premier passage a échoué, et c'est instructif.** Le contrôle conftest était vert, mais le contrôle Trivy a échoué. Il a trouvé **9 failles de gravité HIGH** dans l'image de TaskFlow 2.2.0, toutes dans des bibliothèques Python. Par exemple, la bibliothèque `starlette` est installée en version 0.41.3, alors que la faille CVE-2025-62727 (un risque de déni de service) est corrigée dans la version 0.49.1. La règle R5 interdit les failles graves **qui ont déjà un correctif**, et ici il y en avait.
+
+![la PR #30 : conftest vert, Trivy en échec](docs/preuve/42-pssi-pr30-trivy-echec.png)
+
+![le rapport de Trivy : 9 failles HIGH](docs/preuve/43-pssi-trivy-9-high.png)
+
+**Pourquoi on n'a pas simplement corrigé.** L'image de TaskFlow est fournie par un dépôt externe (celui du cours) : on ne peut pas la reconstruire depuis notre dépôt GitOps pour mettre à jour les bibliothèques. La règle de la PSSI prévoit ce cas : on peut faire une **exception, à condition qu'elle soit écrite, justifiée, datée et limitée dans le temps, et validée en PR**. On a donc créé un fichier `.trivyignore` qui liste les 9 failles concernées, avec en commentaire :
+
+- l'image concernée (TaskFlow 2.2.0),
+- la justification (image externe, impossible à reconstruire ici),
+- les responsables (Hamza et Ezzat),
+- la date de création (15/10/2026) et la **date d'expiration (22/10/2026)**,
+- le suivi à faire : reconstruire une image corrigée, puis supprimer toutes ces exceptions.
+
+Avec cette exception, le contrôle Trivy est passé au vert : les deux contrôles réussissent.
+
+![les deux contrôles sont verts](docs/preuve/44-pssi-checks-verts.png)
+
+À noter : cette exception n'est pas une façon de contourner la règle. Elle reconnaît une faille connue, dit pourquoi on l'accepte, qui en répond, et jusqu'à quand. Passé le 22/10/2026, elle doit disparaître.
+
+### Étape 5 : rendre les contrôles obligatoires
+
+Un contrôle qu'on peut ignorer n'est qu'un conseil. On a donc modifié le ruleset de la branche `main` : l'option **« Require status checks to pass »** est activée, avec les deux contrôles **PSSI manifests (conftest)** et **PSSI images (Trivy)** en obligatoires. On a aussi gardé **« Require branches to be up to date before merging »** : une PR doit être testée avec la dernière version de `main` avant d'être mergée. Désormais, le bouton de merge reste bloqué tant que ces deux contrôles ne sont pas verts.
+
+![les contrôles obligatoires dans le ruleset](docs/preuve/45-pssi-ruleset-checks-obligatoires.png)
+
+![détail des contrôles obligatoires](docs/preuve/46-pssi-ruleset-zoom.png)
+
+### Étape 6 : prouver que ça bloque vraiment
+
+Pour vérifier que les règles ne sont pas décoratives, on a volontairement ouvert une PR **non conforme** : sur la branche `test/pssi-nonconforme`, on remplace l'image de TaskFlow par `nginx:latest`. Cette image enfreint deux règles à la fois :
+
+- **R1** : elle utilise le tag `latest`, qui ne dit pas quelle version tourne réellement ;
+- **R2** : elle ne vient pas de notre registre autorisé.
+
+En local, conftest refuse ce fichier avec deux échecs, un par règle :
+
+```
+FAIL - apps/taskflow/rollout.yaml - PSSI-R1 : le conteneur 'taskflow' utilise le tag latest (nginx:latest)
+FAIL - apps/taskflow/rollout.yaml - PSSI-R2 : l'image du conteneur 'taskflow' ne vient pas du registre autorisé (nginx:latest)
+25 tests, 23 passed, 0 warnings, 2 failures, 0 exceptions
+```
+
+![conftest refuse nginx:latest](docs/preuve/47-pssi-conftest-nginx-latest.png)
+
+Sur GitHub, la même chose se produit dans la PR : le contrôle **PSSI manifests (conftest)** passe au rouge, marqué **Required** (obligatoire), et le bouton **Merge pull request** reste grisé. Cette PR est là pour servir de preuve : elle n'est pas faite pour être mergée.
+
+![la PR non conforme est bloquée](docs/preuve/48-pssi-pr-non-conforme-bloquee.png)
+
+### Le tableau règle, contrôle, outil, preuve
+
+| Règle | Ce qu'elle exige | Contrôle automatique | Outil | Preuve |
+| --- | --- | --- | --- | --- |
+| **R1** | Tag explicite, jamais `latest` | Deux règles dans `policies/kubernetes.rego` (pas de tag, tag `latest`) | conftest | `nginx:latest` refusé : échec R1 ([capture](docs/preuve/47-pssi-conftest-nginx-latest.png)), PR bloquée ([capture](docs/preuve/48-pssi-pr-non-conforme-bloquee.png)) |
+| **R2** | Images uniquement du registre `ghcr.io/9m7fjfpv9k-cyber/` | Une règle dans `policies/kubernetes.rego` | conftest | `nginx:latest` refusé : échec R2 ([capture](docs/preuve/47-pssi-conftest-nginx-latest.png)) |
+| **R3** | Limite de mémoire sur chaque conteneur | Règle R3 écrite (étape 2) | conftest | 20 tests réussis une fois R3 ajoutée ([capture](docs/preuve/39-pssi-r3-20-tests.png)) |
+| **R4** | Pods jamais en root (`runAsNonRoot: true`) | Règle R4 écrite (étape 2) + `securityContext` ajouté au Rollout (étape 3) | conftest | 25 tests réussis ([capture](docs/preuve/40-pssi-r4-25-tests.png)) |
+| **R5** | Aucune faille HIGH ou CRITICAL qui a un correctif | Job `PSSI images (Trivy)` dans `.github/workflows/pssi.yml` | Trivy | 9 failles HIGH trouvées ([capture](docs/preuve/43-pssi-trivy-9-high.png)), puis exceptions datées dans `.trivyignore` et contrôle vert ([capture](docs/preuve/44-pssi-checks-verts.png)) |
+| **Obligatoire** | Un contrôle rouge bloque le merge | Ruleset de `main` : « Require status checks to pass » | GitHub | Contrôles obligatoires ([capture](docs/preuve/45-pssi-ruleset-checks-obligatoires.png)), merge grisé ([capture](docs/preuve/48-pssi-pr-non-conforme-bloquee.png)) |
+
+### Ce qu'on retient
+
+Une règle de sécurité n'existe vraiment que si une machine la vérifie à chaque changement, et une exception n'est acceptable que si elle est écrite, justifiée, attribuée à quelqu'un et datée. Ici, la chaîne a refusé tout ce qui enfreignait la PSSI, y compris une faille réelle trouvée par Trivy dans notre propre image, et on a pu l'accepter temporairement de façon contrôlée.
+
