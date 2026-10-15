@@ -202,3 +202,207 @@ Notre choix serait le **Canary**, pour ces raisons.
 
 Un déploiement progressif limite les dégâts d'un bug mais ne les empêche pas, et les probes ne remplacent pas une mesure côté utilisateurs. Dans les deux cas, les actions faites sur le cluster (`promote`, `abort`) ne sont pas tracées dans Git : c'est la PR qui remet Git et la réalité d'accord.
 
+## Jour 3, lab du matin : le test de charge décide seul (15/10/2026)
+
+### Partie A, étape 2 : l'étalon de la version 2.0.0
+
+Avant de laisser une machine décider si une version est bonne, il faut savoir à quoi ressemble une version bonne. On a donc mesuré la 2.0.0, celle qui tourne en production, avec **k6**, un outil qui envoie beaucoup de requêtes à l'application et mesure ce qui se passe.
+
+**Ce que fait le test.** `./scripts/charge.sh http://taskflow` simule 5 utilisateurs qui appellent l'application pendant 30 secondes. Ils ont envoyé environ 730 requêtes, soit une vingtaine par seconde.
+
+**Ce qu'on regarde.** Deux seuils, écrits dans le test lui-même :
+
+- **moins de 2 % de requêtes en erreur** : au-delà, l'application plante trop souvent ;
+- **p95 sous 250 ms** : 95 % des réponses doivent arriver en moins d'un quart de seconde. Le p95 est plus honnête que la moyenne, parce qu'il montre la lenteur que quelques réponses très longues cachent dans une moyenne.
+
+Si l'un des deux seuils n'est pas respecté, k6 termine en échec. C'est ce signal que le déploiement utilisera plus tard pour s'arrêter tout seul.
+
+**Ce qu'on a mesuré.** On a lancé le test trois fois pour voir si le résultat était stable :
+
+| Essai | Requêtes | Erreurs | p95 | Seuils |
+| --- | --- | --- | --- | --- |
+| 1 | 730 | 0,00 % | 9,5 ms | respectés |
+| 2 | 725 | 0,00 % | 13,2 ms | respectés |
+| 3 | 731 | 0,00 % | 8,5 ms | respectés |
+
+La 2.0.0 ne produit aucune erreur et répond en général en moins de 15 ms, soit **plus de 15 fois en dessous du seuil de 250 ms**. Ce sera notre étalon : toute version qui s'écarte beaucoup de ces valeurs est suspecte.
+
+![étalon k6 sur la 2.0.0](docs/preuve/29-etalon-k6-2.0.0.png)
+
+Un point à garder en tête : les trois essais donnent un p95 entre 8,5 et 13,2 ms. Cette variation vient de la machine locale, pas de l'application, ce qui explique que le seuil de 250 ms laisse une grande marge.
+
+### Partie A, étapes 3 et 4 : brancher l'analyse automatique
+
+**L'idée, en simple.** Jusqu'ici, pendant un canary, c'est nous qui regardions les résultats et qui décidions d'avancer ou de tout arrêter. Maintenant, on confie cette décision au test de charge : à chaque nouvelle version, le déploiement lance tout seul le test k6 sur la nouvelle version, et selon le résultat, il continue ou il abandonne.
+
+**Ce qu'on a ajouté** (PR #25, `feat/analyse-auto`, approuvée par Ezzat et mergée vers 09:03 UTC) : 4 fichiers dans `apps/taskflow/`.
+
+| Fichier | À quoi il sert |
+| --- | --- |
+| `analysis-template.yaml` | La recette de l'analyse : lancer un petit programme k6 (un « Job »). S'il réussit, on continue, s'il échoue, on abandonne. |
+| `configmap-k6.yaml` | Le scénario du test et ses seuils : moins de 2 % d'erreurs, p95 sous 250 ms. |
+| `service-canary.yaml` | Une adresse interne, `taskflow-canary`, qui ne mène **qu'aux pods de la nouvelle version**. |
+| `rollout.yaml` (modifié) | Le déploiement lui-même : après le palier de 25 %, il attend 20 secondes, lance l'analyse, puis continue (50 %, 75 %, 100 %) ou s'arrête. L'image reste en 2.0.0. |
+
+**Pourquoi un service `taskflow-canary` à part ?** Si on testait via le service normal, 75 % des requêtes tomberaient encore sur l'ancienne version, qui marche, et un défaut de la nouvelle version serait dilué dans la masse. Avec `taskflow-canary`, le test ne voit **que** la nouvelle version : on mesure vraiment ce qu'on s'apprête à livrer.
+
+**Ce qu'on a vérifié après le merge.** Argo CD a tout appliqué tout seul. On y retrouve :
+
+- le `ConfigMap` `k6-robustesse` et le service `taskflow-canary`, créés quelques secondes plus tôt,
+- l'`AnalysisTemplate` `robustesse-k6` (apparu un peu après les autres, c'est la raison pour laquelle la première commande ne le montrait pas encore),
+- l'application `Synced` / `Healthy`,
+- le Rollout `Healthy`, toujours en 2.0.0 : rien n'a été redéployé, on a seulement changé la façon de déployer. Il est passé de 6 à **7 étapes**, ce qui montre qu'il a bien pris en compte la pause et l'analyse.
+
+![ressources créées](docs/preuve/30-analyse-auto-ressources.png)
+
+![AnalysisTemplate présent et application Synced](docs/preuve/31-analysistemplate-synced.png)
+
+### Partie B, étapes 1 et 2 : l'incident de la 2.1.0 et l'enquête
+
+**Ce qu'on a fait.** On a poussé la version 2.1.0, celle qui est défectueuse, par une PR normale (PR #26, approuvée par Ezzat et mergée vers 09:14 UTC), puis on n'a **plus rien touché**. Le but était de voir si la chaîne se défendait seule.
+
+**Ce qui s'est passé, dans l'ordre** (heures UTC, arrondies) :
+
+| Heure | Ce qui s'est passé |
+| --- | --- |
+| ~09:14 | Merge de la PR #26 : l'image passe de 2.0.0 à 2.1.0 |
+| ~09:16 | Argo CD déploie (environ 2 minutes après le merge) |
+| ~09:16 | Le canary démarre : **1 pod sur 4** en 2.1.0 (25 %), puis une pause de 20 secondes |
+| ~09:16 | Le Rollout lance l'analyse : un petit programme k6 teste le service `taskflow-canary`, qui ne mène qu'au pod en 2.1.0 |
+| ~09:17 | k6 trouve que la version est mauvaise, l'analyse échoue, et le Rollout **annule tout seul** : le pod 2.1.0 est supprimé et les 4 pods en 2.0.0 reprennent tout le trafic |
+
+Entre le moment où la 2.1.0 a reçu du trafic et celui où elle a été retirée, il s'est écoulé environ **une minute**, et un seul pod sur quatre était concerné. Personne n'a eu à appuyer sur un bouton.
+
+![le canary en 2.1.0, 25 %, en pause](docs/preuve/32-analyse-2.1.0-canary-25pct.png)
+
+![l'abort automatique : Degraded, RolloutAborted](docs/preuve/33-analyse-2.1.0-abort-automatique.png)
+
+La vue d'ensemble après l'abort, en capture : la révision 6 (2.1.0) est à 0 pod, son `AnalysisRun` est `Failed` (1 échec) avec le Job k6 `Failed`, et la révision 5 (2.0.0) a repris ses 4 pods.
+
+![AnalysisRun en échec pour la 2.1.0](docs/preuve/34-analysisrun-echec-2.1.0.png)
+
+La même vue en texte, relevée sur le cluster juste après (commande `kubectl argo rollouts get rollout taskflow -n taskflow`, extrait). La révision 6 (2.1.0) est à 0 pod, son `AnalysisRun` est en échec avec le Job k6 qui a échoué, et la révision 5 (2.0.0) a repris ses 4 pods :
+
+```
+Status:          ✖ Degraded
+Message:         RolloutAborted: Rollout aborted update to revision 6: ... Metric "test-de-charge-k6" assessed Failed due to failed (1) > failureLimit (0)
+Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.0.0 (stable)
+
+├──# revision:6
+│  ├──⧉ taskflow-df976ccb5      ReplicaSet   • ScaledDown   canary
+│  └──α taskflow-df976ccb5-6-2  AnalysisRun  ✖ Failed       ✖ 1
+│     └──⊞ ...test-de-charge-k6.1  Job       ✖ Failed
+├──# revision:5
+│  └──⧉ taskflow-c6cf57bd6      ReplicaSet   ✔ Healthy      stable
+│     ├──□ taskflow-c6cf57bd6-xjtmp  Pod     ✔ Running
+│     ├──□ taskflow-c6cf57bd6-9ccqh  Pod     ✔ Running
+│     ├──□ taskflow-c6cf57bd6-78w8h  Pod     ✔ Running
+│     └──□ taskflow-c6cf57bd6-dwf4l  Pod     ✔ Running
+```
+
+### L'enquête : les preuves
+
+Pour comprendre ce qui a échoué, on a suivi la chaîne de preuves du cours, du général au précis.
+
+**Preuve 1, quelle révision et quelle image ?** Le Rollout est `Degraded` avec le message `RolloutAborted: Rollout aborted update to revision 6`. La révision 6 est la 2.1.0 (ReplicaSet `taskflow-df976ccb5`). La production reste en 2.0.0, révision 5, `stable`.
+
+**Preuve 2, quelle analyse a échoué ?** Il y a une seule analyse, `taskflow-df976ccb5-6-2`, en état `Failed`. Elle porte sur une seule métrique, `test-de-charge-k6`, avec le message :
+
+```
+Metric "test-de-charge-k6" assessed Failed due to failed (1) > failureLimit (0)
+```
+
+Autrement dit : on ne tolérait aucun échec du test, il y en a eu un, donc c'est refusé.
+
+**Preuve 3, qu'est-ce que k6 a mesuré ?** C'est là qu'on voit pourquoi. Extrait des logs du Job k6, qui a visé le pod en 2.1.0 seulement :
+
+```
+http_req_duration  ✗ 'p(95)<250'  p(95)=311.52ms
+http_req_failed    ✗ 'rate<0.02'  rate=33.00%
+http_reqs: 300     (dont 99 en erreur)
+```
+
+Les **deux seuils** sont dépassés :
+
+- **33 % des requêtes échouent**, alors que la limite est de 2 %. Un tiers des utilisateurs qui tomberaient sur cette version verrait une erreur.
+- **Le p95 est de 311 ms**, alors que la limite est de 250 ms, et que la 2.0.0 répondait en 8 à 13 ms (notre étalon). La version est donc environ **30 fois plus lente**. Même les réponses correctes mettent en moyenne 305 ms.
+
+**Preuve 4, la chronologie.** Les événements Kubernetes confirment l'ordre (`RolloutUpdated`, `RolloutPaused`, `AnalysisRunRunning`, puis `MetricFailed`, `AnalysisRunFailed` et `RolloutAborted`, tous au même moment, suivis de la remise à 4 pods de la 2.0.0). On a relevé ces événements tout de suite, car Kubernetes ne les garde qu'environ une heure.
+
+### D'où vient l'erreur, et pourquoi les probes étaient vertes ?
+
+**Un défaut simulé, pas un vrai bug.** Dans le code de TaskFlow, il y a un petit morceau appelé `inject_faults`, dont le commentaire dit : « Simule une version défaillante : /health reste sain, les utilisateurs souffrent ». Il a été prévu par le cours pour fabriquer exprès une mauvaise version. On l'a trouvé en lisant le code de l'image (`/app/app/main.py`). Il lit deux réglages :
+
+- `LATENCY_MS` : combien de millisecondes attendre avant de répondre ;
+- `FAILURE_RATE` : la chance, entre 0 et 1, de répondre une erreur 500 (« Erreur interne ») au lieu de la vraie réponse.
+
+Ces réglages sont fixés dans chaque image. On peut les lire avec `docker image inspect` :
+
+| Version | `FAILURE_RATE` | `LATENCY_MS` | Comportement |
+| --- | --- | --- | --- |
+| 2.0.0 | 0 | 0 | normal |
+| **2.1.0** | **0,3** | **300** | **30 % d'erreurs et 0,3 s de retard sur chaque requête** |
+| 2.2.0 | 0 | 0 | normal (corrigée) |
+
+**Ça colle avec ce que k6 a mesuré.** Avec 30 % d'erreurs réglées, k6 a vu 33 % (99 sur 300) : l'écart vient du hasard. Avec 300 ms de retard, les réponses prenaient en moyenne 305 ms et le p95 était à 311 ms, alors que la 2.0.0 répond en 4 à 6 ms en moyenne. Tout vient bien de ces deux réglages.
+
+**Pourquoi les probes étaient vertes.** Le code applique le retard et les erreurs à toutes les routes **sauf** `/health` (la ligne `if request.url.path != "/health"`). Or les sondes de Kubernetes ne regardent que `/health`. Elles recevaient donc toujours une réponse rapide et correcte : le pod était déclaré sain pendant que tout le reste était lent et plantait une fois sur trois. Une sonde dit « le programme tourne », pas « le programme rend le service attendu ». Seul un test qui envoie du vrai trafic sur les vraies routes, comme k6, pouvait le voir.
+
+**Dans la vraie vie.** Ici le défaut est volontaire. Mais le mécanisme est réaliste : une vraie régression (requête de base de données lente, dépendance qui tombe, bug sur une route) laisserait aussi `/health` vert. C'est pour ça qu'un déploiement progressif avec une analyse sur de vraies requêtes protège mieux qu'une simple sonde.
+
+### Comment on aurait pu l'empêcher
+
+Il y a trois façons de se protéger d'une mauvaise version : **l'empêcher** d'arriver au cluster, **la repérer vite** quand elle arrive, et **limiter les dégâts** si elle passe. Notre chaîne faisait déjà les deux dernières. Voici ce qui manquait pour la première, et ce qu'on peut encore améliorer.
+
+**1. Tester la version avant même de la publier (empêcher).** Le défaut était dans l'image elle-même. Un test de charge lancé dans la chaîne de construction de l'application, avant de publier l'image, aurait vu les 33 % d'erreurs et les 300 ms de retard et refusé de créer la 2.1.0. Au moment du déploiement, il est déjà tard : on a seulement un `git revert` à faire. C'est le plus efficace, parce que la mauvaise version n'arrive jamais jusqu'aux utilisateurs.
+
+**2. Des sondes qui regardent une vraie route (repérer).** Nos sondes ne visaient que `/health`, que le code exclut du défaut. Si elles avaient appelé une vraie route (par exemple `/tasks`), le pod 2.1.0 n'aurait jamais été déclaré prêt, et Kubernetes ne l'aurait pas mis en service. On repère alors le problème dès le démarrage du pod, sans même attendre l'analyse de charge.
+
+**3. Un test automatique à chaque palier, pas seulement au premier (limiter).** L'analyse se fait aujourd'hui une seule fois, à 25 %. Si un défaut n'apparaissait qu'à plus forte charge, il passerait ce palier. Refaire l'analyse à 50 % et 75 % réduit ce risque.
+
+**4. Regarder ce que contient l'image, pas seulement son numéro (empêcher).** Notre PR ne changeait qu'un numéro de version, donc la personne qui relisait ne pouvait pas voir les réglages de panne placés dans l'image. Exiger un contrôle automatique sur l'image (tests de charge ou analyse de sa configuration) dans la chaîne, avant d'autoriser une PR qui la référence, comble ce trou.
+
+**5. Garder un seuil strict (limiter).** Notre analyse acceptait zéro échec (`failureLimit: 0`) et des seuils précis. C'est ce qui a permis un abort en environ une minute. Des seuils plus souples auraient pu laisser passer la 2.1.0.
+
+**Ce qui a déjà bien joué.** Le canary a limité l'exposition à un pod sur quatre, l'analyse sur `taskflow-canary` a mesuré la nouvelle version seule, et l'abort s'est fait sans intervention. Le déploiement progressif ne remplace pas les tests en amont : il sert de dernier filet quand quelque chose a échappé aux tests.
+
+### Ce qu'il reste à faire après l'abort
+
+L'abort a protégé les utilisateurs, mais il n'a pas changé Git : `rollout.yaml` dit toujours **2.1.0**. Il faut donc remettre la vérité dans Git par une PR de revert, puis livrer la version corrigée 2.2.0 (étapes suivantes du lab).
+
+### Partie B, étape 3 : remettre Git d'accord par un revert
+
+Après l'abort, la production était sauve, mais **Git disait toujours 2.1.0**. L'abort est une action du cluster : il n'a rien changé dans le dépôt. On a donc fait un revert de la PR #26 par une nouvelle PR (PR #27, approuvée par Ezzat, mergée vers 09:26 UTC). Argo CD l'a appliquée quelques secondes plus tard : le Rollout est repassé `Healthy` en 2.0.0, Argo CD `Synced` / `Healthy`. Git, le cluster et les utilisateurs disaient de nouveau la même chose.
+
+Entre l'abort (vers 09:17) et le revert (vers 09:26), Git est resté en désaccord avec la réalité pendant environ **neuf minutes**. Ce n'était pas dangereux, car plus personne n'était exposé, mais c'est un écart à ne pas laisser traîner.
+
+La trace de l'échec est restée visible dans l'historique du Rollout : la révision 6 garde son `AnalysisRun` en `Failed`.
+
+![après le revert : Healthy en 2.0.0, Synced](docs/preuve/35-revert-2.1.0-healthy.png)
+
+### Partie B, étape 4 : la 2.2.0, la version corrigée
+
+On a livré la version corrigée 2.2.0 par une PR normale (déployée par Argo CD vers 09:34 UTC), et on a de nouveau **laissé faire**. Cette fois le Rollout est monté à 25 %, a attendu 20 secondes, a lancé l'analyse k6, qui a **réussi**, puis il a continué tout seul : 50 %, 75 %, 100 %, jusqu'à `Healthy` avec la 2.2.0 en `stable`. Aucune commande de notre part entre le merge et la fin.
+
+La capture ci-dessous réunit les deux analyses sur le même écran : celle de la 2.2.0 (`Successful`, révision 8) et celle de la 2.1.0 qui avait échoué (`Failed`, révision 6).
+
+![AnalysisRun réussi pour la 2.2.0, à côté de l'échec de la 2.1.0](docs/preuve/36-analysisrun-succes-2.2.0.png)
+
+À la fin, le Rollout est `Healthy` à 100 % : la 2.2.0 est `stable` sur 4 pods, l'ancienne 2.0.0 est `ScaledDown`, et on retrouve côte à côte l'analyse réussie de la 2.2.0 et celle qui avait échoué pour la 2.1.0.
+
+![Rollout final : 2.2.0 à 100 %, Healthy](docs/preuve/37-canary-2.2.0-100pct.png)
+
+**Ce que k6 a mesuré**, version par version, sur les mêmes seuils (moins de 2 % d'erreurs, p95 sous 250 ms) :
+
+| Version | Requêtes | Erreurs | p95 | Résultat de l'analyse |
+| --- | --- | --- | --- | --- |
+| 2.0.0 (étalon, test à la main) | environ 730 | 0,00 % | 8,5 à 13,2 ms | seuils respectés |
+| **2.1.0** (analyse automatique) | 300 | **33,00 %** | **311,5 ms** | **échec, abort automatique** |
+| **2.2.0** (analyse automatique) | 736 | 0,00 % | 6,6 ms | **réussite, promotion automatique** |
+
+La 2.1.0 a franchi les deux seuils à la fois (erreurs et lenteur), conformément à ses réglages. La 2.2.0 est revenue aux réglages normaux et passe sans problème.
+
+### Postmortem
+
+Le postmortem de l'incident de la 2.1.0 est dans [docs/postmortem-2.1.0.md](docs/postmortem-2.1.0.md).
+
