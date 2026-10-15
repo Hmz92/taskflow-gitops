@@ -1,0 +1,19 @@
+# Exception temporaire PSSI-R5 — image TaskFlow 2.2.0
+# Image : ghcr.io/9m7fjfpv9k-cyber/taskflow:2.2.0
+# Justification : l'image pédagogique est fournie par un dépôt externe et ne peut
+# pas être reconstruite depuis ce dépôt GitOps. Une nouvelle image doit mettre à
+# jour Starlette et urllib3 avant de remplacer cette exception.
+# Responsable : équipe TaskFlow — Hamza et Ezzat
+# Création : 2026-10-15
+# Expiration : 2026-10-22
+# Suivi : reconstruire une image corrigée, puis supprimer toutes ces exceptions.
+
+CVE-2025-62727
+CVE-2026-48818
+CVE-2026-54283
+CVE-2025-66418
+CVE-2025-66471
+CVE-2026-21441
+CVE-2026-44431
+CVE-2026-97687
+CVE-2026-97689
